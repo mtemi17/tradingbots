@@ -1,0 +1,825 @@
+//+------------------------------------------------------------------+
+//|                                             ORB_SmartTrap_EA.mq5 |
+//|                      Copyright 2023, Mtemi |
+//|                                              https://www.example.com |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2023, Mtemi"
+#property link      "https://www.example.com"
+#property version   "1.21"
+#property description "Opening Range Breakout EA with manual session times, multi-session capability, and advanced trap logic."
+
+#include <Trade\Trade.mqh>
+
+//--- Enums for User Inputs for better readability
+enum ENUM_MONEY_MANAGEMENT
+{
+    RISK_PERCENT,    // Calculate lot size based on risk percentage
+    FIXED_LOT        // Use a fixed lot size
+};
+
+enum ENUM_TRAP_TP_METHOD
+{
+    TP_OPPOSITE_RANGE, // Target the opposite side of the OR
+    TP_FIXED_RR        // Use a fixed Risk:Reward ratio
+};
+
+// Internal enum to identify session types
+enum ENUM_SESSION_TYPE
+{
+    SESSION_TYPE_ASIAN,
+    SESSION_TYPE_LONDON,
+    SESSION_TYPE_NEW_YORK
+};
+
+// Structure to hold the state for each trading session
+struct SessionState
+{
+    bool     isRangeFound;
+    bool     isTradeTaken;
+    double   orHigh;
+    double   orLow;
+    datetime orStartTime;
+    datetime orEndTime;
+};
+
+
+//+------------------------------------------------------------------+
+//| Expert Advisor Inputs                                            |
+//+------------------------------------------------------------------+
+//--- Trading Session Settings
+input group           "Trading Session Settings"
+input string          session_OR_Duration   = "00:15";         // Duration of the Opening Range for each session (HH:MM)
+input string          session_TradeDuration = "03:00";         // How long to look for trades after session start (HH:MM)
+
+//--- Asian Session
+input group           "Asian Session"
+input bool            session_EnableAsian   = true;            // Enable Asian Session trading?
+input string          asian_SessionStart    = "03:00";         // Asian session start time (HH:MM Server Time)
+
+//--- London Session
+input group           "London Session"
+input bool            session_EnableLondon  = true;            // Enable London Session trading?
+input string          london_SessionStart   = "10:00";         // London session start time (HH:MM Server Time)
+
+//--- New York Session
+input group           "New York Session"
+input bool            session_EnableNewYork = true;            // Enable New York Session trading?
+input string          ny_SessionStart       = "16:30";         // New York session start time (HH:MM Server Time)
+
+//--- Trade Entry Settings
+input group           "Trade Entry Settings"
+input bool            enable_MarketBreakout = true;       // Trade on standard breakout candle?
+input ulong           MagicNumber         = 13579;        // EA's unique magic number
+input string          EaComment           = "ORB_EA";     // Comment for orders
+input int             bufferTicks         = 2;            // Buffer in Ticks (Points) for Stop orders
+
+//--- Smart Trap Settings
+input group           "Smart Trap Settings"
+input bool            enable_SmartTrap      = true;       // Trade on trap/fakeout candle?
+input ENUM_TRAP_TP_METHOD trap_TP_Method    = TP_OPPOSITE_RANGE; // Take Profit method for traps
+input double          trap_FixedRR        = 3.0;          // Fixed RR for trap trades if selected
+
+//--- Trend Filter Settings
+input group           "Trend Filter Settings"
+input bool            filter_Enable       = true;         // Enable Trend Filter?
+input ENUM_TIMEFRAMES filter_Timeframe    = PERIOD_H1;    // Timeframe for the EMA
+input int             filter_EmaPeriod    = 200;          // Period for the EMA
+
+//--- Time-Based Exit Settings
+input group           "Time-Based Exit Settings"
+input bool            eod_EnableClose     = true;         // Enable End-of-Day close?
+input string          eod_CloseTime       = "23:00";      // Server time to close all trades (HH:MM)
+
+//--- Stop Loss and Take Profit Settings
+input group           "Stops and Targets"
+input double          RiskRewardRatio     = 1.8;          // Risk:Reward Ratio for standard Take Profit calculation
+input bool            UseSmartSL          = true;         // Use breakout candle for SL if it's large?
+input double          SmartSLThreshold    = 1.2;          // Multiplier for Smart SL (e.g., 1.2 = 20% larger)
+
+//--- Risk Management Settings
+input group           "Risk Management"
+input ENUM_MONEY_MANAGEMENT MoneyManagementMode = RISK_PERCENT;  // Lot sizing method
+input double          RiskPercentPerTrade = 1.0;          // Risk % of account balance per trade
+input double          FixedLotSize        = 0.01;         // Fixed lot size if selected
+input double          MaxLotSize          = 10.0;         // Maximum allowed lot size
+
+//--- Pyramiding Settings
+input group           "Pyramiding Settings"
+input bool            pyramid_Allow       = false;        // Enable adding to winning trades?
+input int             pyramid_MaxEntries  = 2;            // Max number of additional entries
+input double          pyramid_DistanceRR  = 0.5;          // Add position when in profit by X times initial risk (0.5 = 50%)
+input double          pyramid_LotMultiplier = 1.0;      // Lot size multiplier for new entries
+input bool            pyramid_MoveSLToBreakEven= true;         // Move SL to original entry price after adding?
+
+//+------------------------------------------------------------------+
+//| Global Variables                                                 |
+//+------------------------------------------------------------------+
+CTrade      trade;                     // Trading object
+datetime    todayDate;                 // To track the current date
+datetime    lastBarTime         = 0;     // For new bar detection
+bool        isEodCloseDoneToday = false; // Flag for End-of-Day close
+bool        isFilterActive      = false; // Runtime status of the trend filter
+int         ema_handle          = INVALID_HANDLE; // Handle for the EMA indicator
+
+// State management for each session
+SessionState asianState;
+SessionState londonState;
+SessionState nyState;
+
+// Pyramiding state variables (applies to the first trade of the day)
+int         pyramid_Count         = 0;     // Counter for additional entries
+double      pyramid_InitialLotSize= 0.0;   // Stores the lot size of the first trade
+double      pyramid_InitialEntryPrice= 0.0;   // Stores the entry price of the first trade
+double      pyramid_InitialStopLoss  = 0.0;   // Stores the SL of the first trade
+
+// Object names for visuals
+string asianBoxName = "OR_Box_Asian_" + (string)MagicNumber;
+string londonBoxName = "OR_Box_London_" + (string)MagicNumber;
+string nyBoxName = "OR_Box_NY_" + (string)MagicNumber;
+string entryLineName = "EntryLine_" + (string)MagicNumber;
+string slLineName = "SLLine_" + (string)MagicNumber;
+string tpLineName = "TPLine_" + (string)MagicNumber;
+
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+    //--- Initialize trading object
+    trade.SetExpertMagicNumber(MagicNumber);
+    trade.SetTypeFillingBySymbol(_Symbol);
+    trade.SetDeviationInPoints(5); // Allow small slippage
+    
+    // Initialize date and last bar time for new bar detection
+    todayDate = (datetime)TimeCurrent();
+    lastBarTime = iTime(_Symbol, _Period, 0);
+    
+    //--- Initialize EMA handle for trend filter
+    if(filter_Enable)
+    {
+        ema_handle = iMA(_Symbol, filter_Timeframe, filter_EmaPeriod, 0, MODE_EMA, PRICE_CLOSE);
+        if(ema_handle != INVALID_HANDLE)
+        {
+            isFilterActive = true;
+        }
+        else
+        {
+            Print("Failed to create EMA indicator handle. Trend filter will be inactive.");
+            isFilterActive = false;
+        }
+    }
+    
+    // Initialize session states
+    ResetDailyVariables();
+    
+    PrintFormat("ORB SmartTrap EA v%s Initialized. Magic: %I64u", MagicNumber);
+    PrintFormat("Symbol: %s, TimeFrame: %s", _Symbol, EnumToString(_Period));
+    
+    return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+    //--- Clean up chart objects on exit
+    DeleteVisuals();
+    if(ema_handle != INVALID_HANDLE) IndicatorRelease(ema_handle);
+    PrintFormat("ORB SmartTrap EA Deinitialized. Reason code: %d", reason);
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+    // --- New Bar Detection ---
+    datetime newBarTime = iTime(_Symbol, _Period, 0);
+    if(newBarTime > lastBarTime)
+    {
+        lastBarTime = newBarTime;
+        OnNewBar(_Period);
+    }
+    
+    CheckForPyramiding();
+    CheckForEodClose();
+}
+
+
+//+------------------------------------------------------------------+
+//| New Bar Event Handler (Called from OnTick)                       |
+//+------------------------------------------------------------------+
+void OnNewBar(const int period)
+{
+    MqlDateTime current_dt, today_struct;
+    TimeToStruct(TimeCurrent(), current_dt);
+    TimeToStruct(todayDate, today_struct);
+    
+    if(current_dt.day != today_struct.day)
+    {
+        ResetDailyVariables();
+        todayDate = TimeCurrent();
+    }
+    
+    long tradeWindowSeconds = ParseDurationToSeconds(session_TradeDuration, 10800); // Default to 3 hours
+
+    // --- Process Asian Session ---
+    if(session_EnableAsian && !asianState.isTradeTaken)
+    {
+        if(!asianState.isRangeFound)
+        {
+            if(FindOpeningRange(asian_SessionStart, asianState))
+            {
+                DrawOrBox(asianState, "Asian", clrMediumSeaGreen);
+            }
+        }
+        if(asianState.isRangeFound && TimeCurrent() < asianState.orStartTime + tradeWindowSeconds)
+        {
+            CheckForBreakout(asianState, SESSION_TYPE_ASIAN);
+        }
+    }
+
+    // --- Process London Session ---
+    if(session_EnableLondon && !londonState.isTradeTaken)
+    {
+        if(!londonState.isRangeFound)
+        {
+            if(FindOpeningRange(london_SessionStart, londonState))
+            {
+                DrawOrBox(londonState, "London", clrCornflowerBlue);
+            }
+        }
+        if(londonState.isRangeFound && TimeCurrent() < londonState.orStartTime + tradeWindowSeconds)
+        {
+            CheckForBreakout(londonState, SESSION_TYPE_LONDON);
+        }
+    }
+
+    // --- Process New York Session ---
+    if(session_EnableNewYork && !nyState.isTradeTaken)
+    {
+        if(!nyState.isRangeFound)
+        {
+            if(FindOpeningRange(ny_SessionStart, nyState))
+            {
+                DrawOrBox(nyState, "NY", clrOrange);
+            }
+        }
+        if(nyState.isRangeFound && TimeCurrent() < nyState.orStartTime + tradeWindowSeconds)
+        {
+            CheckForBreakout(nyState, SESSION_TYPE_NEW_YORK);
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Resets daily variables and cleans chart                          |
+//+------------------------------------------------------------------+
+void ResetDailyVariables()
+{
+    isEodCloseDoneToday = false;
+    
+    // Reset session states safely
+    ZeroMemory(asianState);
+    ZeroMemory(londonState);
+    ZeroMemory(nyState);
+    
+    // Reset pyramiding variables
+    pyramid_Count = 0;
+    pyramid_InitialLotSize = 0.0;
+    pyramid_InitialEntryPrice = 0.0;
+    pyramid_InitialStopLoss = 0.0;
+    
+    DeleteVisuals();
+    
+    Print("New day detected. Variables have been reset.");
+}
+
+//+------------------------------------------------------------------+
+//| Finds the high and low of the opening range for a given session  |
+//+------------------------------------------------------------------+
+bool FindOpeningRange(string sessionStartString, SessionState &state)
+{
+    // Parse start time from manual string input
+    string start_parts[];
+    int start_h = 0, start_m = 0;
+    if(StringSplit(sessionStartString, ':', start_parts) == 2)
+    {
+       start_h = (int)StringToInteger(start_parts[0]);
+       start_m = (int)StringToInteger(start_parts[1]);
+    }
+    else
+    {
+       PrintFormat("Invalid Session Start format '%s'. Please use HH:MM.", sessionStartString);
+       return false;
+    }
+
+    // Construct MqlDateTime for today's session start
+    MqlDateTime dt_start;
+    TimeToStruct(TimeCurrent(), dt_start);
+    dt_start.hour = start_h;
+    dt_start.min = start_m;
+    dt_start.sec = 0;
+    
+    state.orStartTime = StructToTime(dt_start);
+
+    // Calculate end time based on duration
+    long durationSeconds = ParseDurationToSeconds(session_OR_Duration, 900);
+    state.orEndTime = (datetime)(state.orStartTime + durationSeconds);
+    
+    if(TimeCurrent() < state.orEndTime)
+    {
+        return false;
+    }
+
+    int bar1 = iBarShift(_Symbol, _Period, state.orStartTime);
+    int bar2 = iBarShift(_Symbol, _Period, state.orEndTime);
+    
+    if(bar1 < 0 || bar2 < 0) return false;
+    
+    int startIndex = MathMax(bar1, bar2);
+    int endIndex = MathMin(bar1, bar2);
+    
+    double highs[], lows[];
+    int barsInRange = startIndex - endIndex + 1;
+    if(barsInRange <= 0) return false;
+
+    if(CopyHigh(_Symbol, _Period, endIndex, barsInRange, highs) < 0 || CopyLow(_Symbol, _Period, endIndex, barsInRange, lows) < 0)
+    {
+        PrintFormat("Failed to copy price data for OR. Error: %d", GetLastError());
+        return false;
+    }
+    
+    state.orHigh = highs[ArrayMaximum(highs)];
+    state.orLow = lows[ArrayMinimum(lows)];
+
+    if(state.orHigh > 0 && state.orLow > 0)
+    {
+        PrintFormat("Opening Range Found for %s. High: %.5f, Low: %.5f", sessionStartString, state.orHigh, state.orLow);
+        state.isRangeFound = true;
+        return true;
+    }
+
+    return false;
+}
+
+//+------------------------------------------------------------------+
+//| Checks for a breakout of a given session's Opening Range         |
+//+------------------------------------------------------------------+
+void CheckForBreakout(SessionState &state, ENUM_SESSION_TYPE sessionType)
+{
+    if(PositionsTotal() > 0) return;
+
+    double closePrice = iClose(_Symbol, _Period, 1);
+    double highPrice = iHigh(_Symbol, _Period, 1);
+    double lowPrice = iLow(_Symbol, _Period, 1);
+    
+    bool isBullishCandle = closePrice > iOpen(_Symbol, _Period, 1);
+    
+    if(isFilterActive)
+    {
+        double ema_buffer[];
+        if(CopyBuffer(ema_handle, 0, 0, 1, ema_buffer) <= 0)
+        {
+            Print("Could not get EMA value. Skipping trade check.");
+            return;
+        }
+        double emaValue = ema_buffer[0];
+        
+        if(closePrice > state.orHigh)
+        {
+            if(enable_SmartTrap && !isBullishCandle && closePrice < emaValue)
+            {
+                ExecuteSmartTrap(ORDER_TYPE_SELL, highPrice, lowPrice, state, sessionType);
+            }
+            else if(enable_MarketBreakout && isBullishCandle && closePrice > emaValue)
+            {
+                ExecuteTrade(ORDER_TYPE_BUY, closePrice, 1, state);
+            }
+        }
+        else if(closePrice < state.orLow)
+        {
+            if(enable_SmartTrap && isBullishCandle && closePrice > emaValue)
+            {
+                 ExecuteSmartTrap(ORDER_TYPE_BUY, highPrice, lowPrice, state, sessionType);
+            }
+            else if(enable_MarketBreakout && !isBullishCandle && closePrice < emaValue)
+            {
+                ExecuteTrade(ORDER_TYPE_SELL, closePrice, 1, state);
+            }
+        }
+    }
+    else
+    {
+        if(closePrice > state.orHigh)
+        {
+            if(enable_SmartTrap && !isBullishCandle) ExecuteSmartTrap(ORDER_TYPE_SELL, highPrice, lowPrice, state, sessionType);
+            else if(enable_MarketBreakout && isBullishCandle) ExecuteTrade(ORDER_TYPE_BUY, closePrice, 1, state);
+        }
+        else if(closePrice < state.orLow)
+        {
+            if(enable_SmartTrap && isBullishCandle) ExecuteSmartTrap(ORDER_TYPE_BUY, highPrice, lowPrice, state, sessionType);
+            else if(enable_MarketBreakout && !isBullishCandle) ExecuteTrade(ORDER_TYPE_SELL, closePrice, 1, state);
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Executes a market order trade                                    |
+//+------------------------------------------------------------------+
+void ExecuteTrade(ENUM_ORDER_TYPE orderType, double entryPrice, int barIndex, SessionState &state)
+{
+    double stopLoss = 0.0;
+    double takeProfit = 0.0;
+    
+    if(UseSmartSL)
+    {
+        double candleHigh = iHigh(_Symbol, _Period, barIndex);
+        double candleLow = iLow(_Symbol, _Period, barIndex);
+        double candleRange = candleHigh - candleLow;
+        double orRange = state.orHigh - state.orLow;
+        
+        if(candleRange > (orRange * SmartSLThreshold))
+        {
+            stopLoss = (orderType == ORDER_TYPE_BUY) ? candleLow : candleHigh;
+            Print("Smart SL activated.");
+        }
+        else
+        {
+            stopLoss = (orderType == ORDER_TYPE_BUY) ? state.orLow : state.orHigh;
+        }
+    }
+    else
+    {
+        stopLoss = (orderType == ORDER_TYPE_BUY) ? state.orLow : state.orHigh;
+    }
+    
+    double slDistance = MathAbs(entryPrice - stopLoss);
+    takeProfit = (orderType == ORDER_TYPE_BUY) ? entryPrice + (slDistance * RiskRewardRatio) : entryPrice - (slDistance * RiskRewardRatio);
+    
+    double lotSize = CalculateLotSize(entryPrice, stopLoss);
+    if(lotSize <= 0) return;
+
+    bool result = false;
+    if(orderType == ORDER_TYPE_BUY) result = trade.Buy(lotSize, _Symbol, entryPrice, stopLoss, takeProfit, EaComment);
+    else result = trade.Sell(lotSize, _Symbol, entryPrice, stopLoss, takeProfit, EaComment);
+    
+    if(result && trade.ResultRetcode() == TRADE_RETCODE_DONE)
+    {
+        state.isTradeTaken = true;
+        PrintFormat("%s Trade Executed @ %.5f, SL: %.5f, TP: %.5f, Lots: %.2f", (orderType == ORDER_TYPE_BUY ? "BUY" : "SELL"), trade.ResultPrice(), stopLoss, takeProfit, lotSize);
+        if(pyramid_InitialEntryPrice == 0.0)
+        {
+            pyramid_InitialEntryPrice = trade.ResultPrice();
+            pyramid_InitialStopLoss = stopLoss;
+            pyramid_InitialLotSize = lotSize;
+        }
+        DrawTradeLines(trade.ResultPrice(), stopLoss, takeProfit);
+    }
+    else
+    {
+        PrintFormat("Order execution failed. Error: %d - %s", trade.ResultRetcode(), trade.ResultComment());
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Executes a pending limit order for a Smart Trap                  |
+//+------------------------------------------------------------------+
+void ExecuteSmartTrap(ENUM_ORDER_TYPE orderType, double candleHigh, double candleLow, SessionState &state, ENUM_SESSION_TYPE sessionType)
+{
+    double entryPrice = (state.orHigh + state.orLow) / 2.0;
+    double stopLoss = (orderType == ORDER_TYPE_BUY) ? candleLow : candleHigh;
+    double takeProfit = 0;
+
+    string sessionComment;
+    switch(sessionType)
+    {
+        case SESSION_TYPE_ASIAN: sessionComment = "_Asian"; break;
+        case SESSION_TYPE_LONDON: sessionComment = "_London"; break;
+        case SESSION_TYPE_NEW_YORK: sessionComment = "_NY"; break;
+    }
+    
+    if(orderType == ORDER_TYPE_BUY)
+    {
+        if(trap_TP_Method == TP_OPPOSITE_RANGE) takeProfit = state.orHigh;
+        else takeProfit = entryPrice + (MathAbs(entryPrice - stopLoss) * trap_FixedRR);
+        
+        if(entryPrice >= SymbolInfoDouble(_Symbol, SYMBOL_ASK))
+        {
+           PrintFormat("Cannot place Buy Limit. Entry price %.5f is not below current Ask price %.5f.", entryPrice, SymbolInfoDouble(_Symbol, SYMBOL_ASK));
+           return;
+        }
+    }
+    else
+    {
+        if(trap_TP_Method == TP_OPPOSITE_RANGE) takeProfit = state.orLow;
+        else takeProfit = entryPrice - (MathAbs(entryPrice - stopLoss) * trap_FixedRR);
+        
+        if(entryPrice <= SymbolInfoDouble(_Symbol, SYMBOL_BID))
+        {
+           PrintFormat("Cannot place Sell Limit. Entry price %.5f is not above current Bid price %.5f.", entryPrice, SymbolInfoDouble(_Symbol, SYMBOL_BID));
+           return;
+        }
+    }
+    
+    double lotSize = CalculateLotSize(entryPrice, stopLoss);
+    if(lotSize > 0)
+    {
+        bool result = false;
+        string comment = EaComment + "_Trap" + sessionComment;
+        if(orderType == ORDER_TYPE_BUY) result = trade.BuyLimit(lotSize, entryPrice, _Symbol, stopLoss, takeProfit, ORDER_TIME_GTC, 0, comment);
+        else result = trade.SellLimit(lotSize, entryPrice, _Symbol, stopLoss, takeProfit, ORDER_TIME_GTC, 0, comment);
+
+        if(result && trade.ResultRetcode() == TRADE_RETCODE_DONE)
+        {
+            state.isTradeTaken = true;
+            PrintFormat("Smart Trap %s Limit order placed.", (orderType == ORDER_TYPE_BUY ? "Buy" : "Sell"));
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Calculates lot size based on risk settings                       |
+//+------------------------------------------------------------------+
+double CalculateLotSize(double entryPrice, double stopLossPrice)
+{
+    if(MoneyManagementMode == FIXED_LOT)
+    {
+        return(FixedLotSize);
+    }
+
+    double lotSize = 0.0;
+    double accountBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+    double slDistance = MathAbs(entryPrice - stopLossPrice);
+    
+    if(slDistance <= 0)
+    {
+        Print("Stop loss distance is zero, cannot calculate lot size.");
+        return 0.0;
+    }
+    
+    double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+    double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+    
+    if(tickValue <= 0 || tickSize <= 0)
+    {
+        Print("Invalid Tick Value or Tick Size. Cannot calculate lot size.");
+        return 0.0;
+    }
+
+    double riskAmount = accountBalance * (RiskPercentPerTrade / 100.0);
+    double lossPerLot = slDistance / tickSize * tickValue;
+
+    if(lossPerLot > 0)
+    {
+        lotSize = riskAmount / lossPerLot;
+    }
+
+    double volMin = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+    double volMax = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+    double volStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+    
+    lotSize = MathFloor(lotSize / volStep) * volStep;
+    
+    lotSize = fmax(volMin, lotSize);
+    lotSize = fmin(volMax, lotSize);
+    lotSize = fmin(MaxLotSize, lotSize);
+    
+    return(lotSize);
+}
+
+
+//+------------------------------------------------------------------+
+//| Event handler for trade transactions                             |
+//+------------------------------------------------------------------+
+void OnTradeTransaction(const MqlTradeTransaction& trans,
+                        const MqlTradeRequest& request,
+                        const MqlTradeResult& result)
+{
+    if(trans.type == TRADE_TRANSACTION_DEAL_ADD && (trans.deal_type == DEAL_TYPE_BUY || trans.deal_type == DEAL_TYPE_SELL))
+    {
+        if(trans.position > 0 && PositionSelectByTicket(trans.position))
+        {
+            if(PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+            {
+                Print("A pending order was triggered. A position has been opened.");
+                
+                if(pyramid_InitialEntryPrice == 0.0)
+                {
+                   pyramid_InitialEntryPrice = trans.price;
+                   pyramid_InitialStopLoss = PositionGetDouble(POSITION_SL);
+                   pyramid_InitialLotSize = PositionGetDouble(POSITION_VOLUME);
+                }
+                
+                DrawTradeLines(trans.price, PositionGetDouble(POSITION_SL), PositionGetDouble(POSITION_TP));
+            }
+        }
+    }
+}
+
+
+//+------------------------------------------------------------------+
+//| Cancels all pending orders for this EA                           |
+//+------------------------------------------------------------------+
+void CancelPendingOrders()
+{
+    int totalOrders = OrdersTotal();
+    for(int i = totalOrders - 1; i >= 0; i--)
+    {
+        ulong ticket = OrderGetTicket(i);
+        if(OrderSelect(ticket))
+        {
+            if(OrderGetString(ORDER_SYMBOL) == _Symbol && OrderGetInteger(ORDER_MAGIC) == MagicNumber)
+            {
+                if(trade.OrderDelete(ticket))
+                {
+                    PrintFormat("Cancelled pending order #%I64u", ticket);
+                }
+            }
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Manages adding positions to a winning trade                      |
+//+------------------------------------------------------------------+
+void CheckForPyramiding()
+{
+    if(!pyramid_Allow || PositionsTotal() == 0 || pyramid_Count >= pyramid_MaxEntries || pyramid_InitialEntryPrice == 0.0)
+    {
+        return;
+    }
+    
+    if(!PositionSelect(_Symbol)) return;
+    if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) return;
+    
+    long positionType = PositionGetInteger(POSITION_TYPE);
+    double currentSL = PositionGetDouble(POSITION_SL);
+    double currentTP = PositionGetDouble(POSITION_TP);
+    
+    double initialRiskDistance = MathAbs(pyramid_InitialEntryPrice - pyramid_InitialStopLoss);
+    if(initialRiskDistance == 0) return;
+    
+    double profitTargetDistance = initialRiskDistance * (pyramid_DistanceRR * (pyramid_Count + 1));
+    
+    double pyramidTriggerPrice = 0;
+    if(positionType == POSITION_TYPE_BUY)
+    {
+        pyramidTriggerPrice = pyramid_InitialEntryPrice + profitTargetDistance;
+        if(SymbolInfoDouble(_Symbol, SYMBOL_BID) > pyramidTriggerPrice)
+        {
+             double newLotSize = pyramid_InitialLotSize * pyramid_LotMultiplier;
+             if(trade.Buy(newLotSize, _Symbol, 0, currentSL, currentTP, EaComment + "_pyramid"))
+             {
+                 PrintFormat("Pyramid BUY entry added. Count: %d", pyramid_Count + 1);
+                 pyramid_Count++;
+                 if(pyramid_MoveSLToBreakEven) MoveSLToBreakEven();
+             }
+        }
+    }
+    else if(positionType == POSITION_TYPE_SELL)
+    {
+        pyramidTriggerPrice = pyramid_InitialEntryPrice - profitTargetDistance;
+        if(SymbolInfoDouble(_Symbol, SYMBOL_ASK) < pyramidTriggerPrice)
+        {
+             double newLotSize = pyramid_InitialLotSize * pyramid_LotMultiplier;
+             if(trade.Sell(newLotSize, _Symbol, 0, currentSL, currentTP, EaComment + "_pyramid"))
+             {
+                 PrintFormat("Pyramid SELL entry added. Count: %d", pyramid_Count + 1);
+                 pyramid_Count++;
+                 if(pyramid_MoveSLToBreakEven) MoveSLToBreakEven();
+             }
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Moves Stop Loss to initial entry price for all open positions    |
+//+------------------------------------------------------------------+
+void MoveSLToBreakEven()
+{
+    if(pyramid_InitialEntryPrice == 0.0) return;
+    
+    PrintFormat("Moving Stop Loss to Break-Even at %.5f", pyramid_InitialEntryPrice);
+    
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        ulong ticket = PositionGetTicket(i);
+        if(PositionSelectByTicket(ticket))
+        {
+             if(PositionGetString(POSITION_SYMBOL) == _Symbol && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+             {
+                  double currentTP = PositionGetDouble(POSITION_TP);
+                  trade.PositionModify(ticket, pyramid_InitialEntryPrice, currentTP);
+             }
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Closes open positions at the specified End-of-Day time           |
+//+------------------------------------------------------------------+
+void CheckForEodClose()
+{
+    if(!eod_EnableClose || PositionsTotal() == 0 || isEodCloseDoneToday)
+    {
+        return;
+    }
+    
+    MqlDateTime dt_close;
+    string time_parts[];
+    if(StringSplit(eod_CloseTime, ':', time_parts) != 2) return;
+    dt_close.hour = (int)StringToInteger(time_parts[0]);
+    dt_close.min = (int)StringToInteger(time_parts[1]);
+    
+    datetime now = TimeCurrent();
+    MqlDateTime dt_now;
+    TimeToStruct(now, dt_now);
+    
+    if(dt_now.hour > dt_close.hour || (dt_now.hour == dt_close.hour && dt_now.min >= dt_close.min))
+    {
+        PrintFormat("End of Day Close time reached (%s). Closing open positions.", eod_CloseTime);
+        for(int i = PositionsTotal() - 1; i >= 0; i--)
+        {
+            ulong ticket = PositionGetTicket(i);
+            if(PositionSelectByTicket(ticket))
+            {
+                if(PositionGetString(POSITION_SYMBOL) == _Symbol && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+                {
+                    trade.PositionClose(ticket);
+                }
+            }
+        }
+        isEodCloseDoneToday = true;
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Parses HH:MM string to total seconds, with a default fallback    |
+//+------------------------------------------------------------------+
+long ParseDurationToSeconds(string duration, long defaultValue)
+{
+    string parts[];
+    if(StringSplit(duration, ':', parts) == 2)
+    {
+        return(StringToInteger(parts[0]) * 3600 + StringToInteger(parts[1]) * 60);
+    }
+    PrintFormat("Invalid duration format '%s'. Falling back to default.", duration);
+    return defaultValue;
+}
+
+//+------------------------------------------------------------------+
+//| Visual Functions                                                 |
+//+------------------------------------------------------------------+
+void DrawOrBox(const SessionState &state, string sessionName, color boxColor)
+{
+    string boxName = "OR_Box_" + sessionName + "_" + (string)MagicNumber;
+    ObjectCreate(0, boxName, OBJ_RECTANGLE, 0, state.orStartTime, state.orHigh, state.orEndTime, state.orLow);
+    ObjectSetInteger(0, boxName, OBJPROP_COLOR, boxColor);
+    ObjectSetInteger(0, boxName, OBJPROP_STYLE, STYLE_DOT);
+    ObjectSetInteger(0, boxName, OBJPROP_BACK, true);
+    ObjectSetInteger(0, boxName, OBJPROP_SELECTABLE, false);
+    ChartRedraw();
+}
+
+void DrawTradeLines(double entry, double sl, double tp)
+{
+    ObjectCreate(0, entryLineName, OBJ_HLINE, 0, 0, entry);
+    ObjectSetInteger(0, entryLineName, OBJPROP_COLOR, clrGreen);
+    ObjectSetInteger(0, entryLineName, OBJPROP_STYLE, STYLE_SOLID);
+    ObjectSetInteger(0, entryLineName, OBJPROP_WIDTH, 2);
+    ObjectSetString(0, entryLineName, OBJPROP_TEXT, "Entry");
+    ObjectSetInteger(0, entryLineName, OBJPROP_SELECTABLE, false);
+    
+    ObjectCreate(0, slLineName, OBJ_HLINE, 0, 0, sl);
+    ObjectSetInteger(0, slLineName, OBJPROP_COLOR, clrRed);
+    ObjectSetInteger(0, slLineName, OBJPROP_STYLE, STYLE_DASH);
+    ObjectSetInteger(0, slLineName, OBJPROP_WIDTH, 2);
+    ObjectSetString(0, slLineName, OBJPROP_TEXT, "Stop Loss");
+    ObjectSetInteger(0, slLineName, OBJPROP_SELECTABLE, false);
+    
+    ObjectCreate(0, tpLineName, OBJ_HLINE, 0, 0, tp);
+    ObjectSetInteger(0, tpLineName, OBJPROP_COLOR, clrBlue);
+    ObjectSetInteger(0, tpLineName, OBJPROP_STYLE, STYLE_DASH);
+    ObjectSetInteger(0, tpLineName, OBJPROP_WIDTH, 2);
+    ObjectSetString(0, tpLineName, OBJPROP_TEXT, "Take Profit");
+    ObjectSetInteger(0, tpLineName, OBJPROP_SELECTABLE, false);
+    
+    ChartRedraw();
+}
+
+void DeleteVisuals()
+{
+    ObjectDelete(0, asianBoxName);
+    ObjectDelete(0, londonBoxName);
+    ObjectDelete(0, nyBoxName);
+    ObjectDelete(0, entryLineName);
+    ObjectDelete(0, slLineName);
+    ObjectDelete(0, tpLineName);
+    ChartRedraw();
+}
+//+------------------------------------------------------------------+
+
+
