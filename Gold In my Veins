@@ -1,0 +1,258 @@
+//+------------------------------------------------------------------+
+//|                                                XAUUSD_EA.mq5 |
+//|                                                 Tezo Dolla|
+//|                                            |
+//+------------------------------------------------------------------+
+#property copyright "Tezo Dolla"
+#property link      "poems"
+#property version   "1.00"
+#property strict
+
+// --- User-customizable inputs ---
+input double       LotSize              = 0.01;      // Trading lot size
+input int          StopLossPips         = 100;       // Stop Loss in points (e.g., 10 pips = 100 points on 5-digit broker)
+input int          TakeProfitPips       = 200;       // Take Profit in points
+input ENUM_TIMEFRAMES TrendTimeframe     = PERIOD_H1; // Higher timeframe for trend
+input int          LookbackForSweep     = 50;        // Number of bars to look back for liquidity sweep
+input int          LookbackForEngulfing = 5;         // Number of bars to check for engulfing pattern
+
+// --- Global variables ---
+CExpert* expert;
+CSymbolInfo        symbolInfo;
+CTrade             trade;
+CMACD* macd;
+double             pip_value;
+datetime           last_trade_time;
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+    // Initialize standard library objects
+    expert = new CExpert();
+    trade.SetExpertMagic(12345); // Set a unique magic number for the EA
+
+    // Check if the symbol is valid
+    if(!symbolInfo.Name(Symbol()))
+    {
+        printf("Failed to set symbol: %s", Symbol());
+        return(INIT_FAILED);
+    }
+    
+    pip_value = symbolInfo.Point();
+    if(symbolInfo.Digits() == 3 || symbolInfo.Digits() == 5)
+    {
+        pip_value = pip_value * 10;
+    }
+
+    // Set expert properties
+    expert.SetSymbol(Symbol());
+    expert.SetLot(LotSize);
+    expert.SetStopLoss(StopLossPips * pip_value);
+    expert.SetTakeProfit(TakeProfitPips * pip_value);
+
+    // Initialize MACD for trend analysis (simple proxy for a higher-timeframe trend)
+    macd = new CMACD();
+    if(macd == NULL)
+    {
+        printf("Failed to create MACD object");
+        return(INIT_FAILED);
+    }
+    
+    // Set MACD parameters
+    macd.Create(Symbol(), TrendTimeframe, 12, 26, 9);
+    
+    printf("EA Initialized successfully.");
+    return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+    delete expert;
+    delete macd;
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+    // Check if a new bar has started on the current chart
+    if(last_trade_time == TimeCurrent())
+    {
+        return;
+    }
+    last_trade_time = TimeCurrent();
+    
+    // Check for open positions to avoid over-trading
+    if(PositionSelect(Symbol()))
+    {
+        return;
+    }
+
+    // --- Check for a BUY signal ---
+    if(CheckForBuySignal())
+    {
+        trade.Buy(LotSize, Symbol(), 0, Ask - expert.StopLoss(), Ask + expert.TakeProfit());
+        printf("BUY signal detected and trade placed.");
+    }
+    
+    // --- Check for a SELL signal ---
+    if(CheckForSellSignal())
+    {
+        trade.Sell(LotSize, Symbol(), 0, Bid + expert.StopLoss(), Bid - expert.TakeProfit());
+        printf("SELL signal detected and trade placed.");
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Check for a higher timeframe bullish trend                       |
+//+------------------------------------------------------------------+
+bool IsHigherTimeframeBullish()
+{
+    // Use the MACD as a simple proxy for trend analysis
+    // Wait for the MACD main line to cross above the signal line
+    double main[], signal[];
+    
+    // Check for enough bars to calculate
+    if(macd.CopyBuffer(0, 1, 2, main) < 2 || macd.CopyBuffer(1, 1, 2, signal) < 2)
+    {
+        return false;
+    }
+    
+    // Check for a bullish cross
+    if(main[1] < signal[1] && main[0] > signal[0])
+    {
+        return true;
+    }
+    
+    return false;
+}
+
+//+------------------------------------------------------------------+
+//| Check for a higher timeframe bearish trend                       |
+//+------------------------------------------------------------------+
+bool IsHigherTimeframeBearish()
+{
+    // Use the MACD as a simple proxy for trend analysis
+    // Wait for the MACD main line to cross below the signal line
+    double main[], signal[];
+    
+    // Check for enough bars to calculate
+    if(macd.CopyBuffer(0, 1, 2, main) < 2 || macd.CopyBuffer(1, 1, 2, signal) < 2)
+    {
+        return false;
+    }
+    
+    // Check for a bearish cross
+    if(main[1] > signal[1] && main[0] < signal[0])
+    {
+        return true;
+    }
+    
+    return false;
+}
+
+//+------------------------------------------------------------------+
+//| Check for a 5-minute bullish engulfing pattern                   |
+//+------------------------------------------------------------------+
+bool IsBullishEngulfing()
+{
+    // Check the last two bars on the current timeframe (M5)
+    double open_prices[], high_prices[], low_prices[], close_prices[];
+    if(CopyOpen(Symbol(), PERIOD_CURRENT, 1, 2, open_prices) < 2 ||
+       CopyHigh(Symbol(), PERIOD_CURRENT, 1, 2, high_prices) < 2 ||
+       CopyLow(Symbol(), PERIOD_CURRENT, 1, 2, low_prices) < 2 ||
+       CopyClose(Symbol(), PERIOD_CURRENT, 1, 2, close_prices) < 2)
+    {
+        return false;
+    }
+    
+    // The previous candle must be bearish and the current candle must be bullish
+    if(close_prices[1] > open_prices[1] && close_prices[0] < open_prices[0])
+    {
+        // Check if the current bullish candle's body engulfs the previous bearish candle's body
+        if(close_prices[1] > open_prices[0] && open_prices[1] < close_prices[0])
+        {
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+//+------------------------------------------------------------------+
+//| Check for a 5-minute bearish engulfing pattern                   |
+//+------------------------------------------------------------------+
+bool IsBearishEngulfing()
+{
+    // Check the last two bars on the current timeframe (M5)
+    double open_prices[], high_prices[], low_prices[], close_prices[];
+    if(CopyOpen(Symbol(), PERIOD_CURRENT, 1, 2, open_prices) < 2 ||
+       CopyHigh(Symbol(), PERIOD_CURRENT, 1, 2, high_prices) < 2 ||
+       CopyLow(Symbol(), PERIOD_CURRENT, 1, 2, low_prices) < 2 ||
+       CopyClose(Symbol(), PERIOD_CURRENT, 1, 2, close_prices) < 2)
+    {
+        return false;
+    }
+    
+    // The previous candle must be bullish and the current candle must be bearish
+    if(close_prices[1] < open_prices[1] && close_prices[0] > open_prices[0])
+    {
+        // Check if the current bearish candle's body engulfs the previous bullish candle's body
+        if(close_prices[1] < open_prices[0] && open_prices[1] > close_prices[0])
+        {
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+//+------------------------------------------------------------------+
+//| Check for a buy signal                                           |
+//+------------------------------------------------------------------+
+bool CheckForBuySignal()
+{
+    // Step 1: Check for higher timeframe trend (bullish)
+    if(!IsHigherTimeframeBullish())
+    {
+        return false;
+    }
+    
+    // Step 2: Check for 5-minute confirmation (bullish engulfing)
+    if(!IsBullishEngulfing())
+    {
+        return false;
+    }
+    
+    // All conditions met for a BUY signal
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| Check for a sell signal                                          |
+//+------------------------------------------------------------------+
+bool CheckForSellSignal()
+{
+    // Step 1: Check for higher timeframe trend (bearish)
+    if(!IsHigherTimeframeBearish())
+    {
+        return false;
+    }
+    
+    // Step 2: Check for 5-minute confirmation (bearish engulfing)
+    if(!IsBearishEngulfing())
+    {
+        return false;
+    }
+    
+    // All conditions met for a SELL signal
+    return true;
+}
+//+------------------------------------------------------------------+
+
